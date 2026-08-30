@@ -1,6 +1,6 @@
 //! Saved mod loadouts: snapshot the current enabled set, diff against current state, apply to disk.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::game_status;
+use crate::session_launch::{self, SessionLaunchState};
 use crate::settings::{ModProfile, Settings, SettingsState, recursive_mod_scan};
 
 use super::folder;
@@ -45,24 +46,15 @@ pub(crate) fn list_profiles(state: &Mutex<Settings>) -> Result<Vec<ModProfile>, 
     Ok(guard.mod_profiles.clone())
 }
 
-pub(crate) fn save_profile(
+fn create_profile_from_enabled(
     state: &Mutex<Settings>,
     name: &str,
-    game_root: &str,
-    recursive: bool,
+    enabled_mods: Vec<String>,
 ) -> Result<ModProfile, String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err("Profile name cannot be empty".to_string());
     }
-
-    let status = get_mods_status(game_root, recursive);
-    let enabled_mods: Vec<String> = status
-        .mod_entries
-        .iter()
-        .filter(|e| e.enabled)
-        .map(|e| e.display_name.clone())
-        .collect();
 
     let now = now_secs();
     let profile = ModProfile {
@@ -79,6 +71,22 @@ pub(crate) fn save_profile(
     guard.mod_profiles.push(profile.clone());
     guard.save()?;
     Ok(profile)
+}
+
+pub(crate) fn save_profile(
+    state: &Mutex<Settings>,
+    name: &str,
+    game_root: &str,
+    recursive: bool,
+) -> Result<ModProfile, String> {
+    let status = get_mods_status(game_root, recursive);
+    let enabled_mods: Vec<String> = status
+        .mod_entries
+        .iter()
+        .filter(|e| e.enabled)
+        .map(|e| e.display_name.clone())
+        .collect();
+    create_profile_from_enabled(state, name, enabled_mods)
 }
 
 pub(crate) fn delete_profile(state: &Mutex<Settings>, name: &str) -> Result<(), String> {
@@ -119,20 +127,11 @@ pub(crate) fn rename_profile(
     guard.save()
 }
 
-pub(crate) fn overwrite_profile(
+fn overwrite_profile_from_enabled(
     state: &Mutex<Settings>,
     name: &str,
-    game_root: &str,
-    recursive: bool,
+    enabled_mods: Vec<String>,
 ) -> Result<ModProfile, String> {
-    let status = get_mods_status(game_root, recursive);
-    let enabled_mods: Vec<String> = status
-        .mod_entries
-        .iter()
-        .filter(|e| e.enabled)
-        .map(|e| e.display_name.clone())
-        .collect();
-
     let mut guard = state.lock().map_err(|e| e.to_string())?;
     let profile = guard
         .mod_profiles
@@ -146,11 +145,27 @@ pub(crate) fn overwrite_profile(
     Ok(result)
 }
 
-pub(crate) fn preview_profile(
+pub(crate) fn overwrite_profile(
     state: &Mutex<Settings>,
     name: &str,
     game_root: &str,
     recursive: bool,
+) -> Result<ModProfile, String> {
+    let status = get_mods_status(game_root, recursive);
+    let enabled_mods: Vec<String> = status
+        .mod_entries
+        .iter()
+        .filter(|e| e.enabled)
+        .map(|e| e.display_name.clone())
+        .collect();
+    overwrite_profile_from_enabled(state, name, enabled_mods)
+}
+
+fn preview_profile_against(
+    state: &Mutex<Settings>,
+    name: &str,
+    all_on_disk: HashSet<String>,
+    currently_enabled: HashSet<String>,
 ) -> Result<ProfileDiff, String> {
     let profile_mods: HashSet<String> = {
         let guard = state.lock().map_err(|e| e.to_string())?;
@@ -161,19 +176,6 @@ pub(crate) fn preview_profile(
             .ok_or_else(|| format!("Profile \"{name}\" not found"))?;
         profile.enabled_mods.iter().cloned().collect()
     };
-
-    let status = get_mods_status(game_root, recursive);
-    let all_on_disk: HashSet<String> = status
-        .mod_entries
-        .iter()
-        .map(|e| e.display_name.clone())
-        .collect();
-    let currently_enabled: HashSet<String> = status
-        .mod_entries
-        .iter()
-        .filter(|e| e.enabled)
-        .map(|e| e.display_name.clone())
-        .collect();
 
     let mut to_enable: Vec<String> = profile_mods
         .iter()
@@ -209,6 +211,27 @@ pub(crate) fn preview_profile(
     })
 }
 
+pub(crate) fn preview_profile(
+    state: &Mutex<Settings>,
+    name: &str,
+    game_root: &str,
+    recursive: bool,
+) -> Result<ProfileDiff, String> {
+    let status = get_mods_status(game_root, recursive);
+    let all_on_disk: HashSet<String> = status
+        .mod_entries
+        .iter()
+        .map(|e| e.display_name.clone())
+        .collect();
+    let currently_enabled: HashSet<String> = status
+        .mod_entries
+        .iter()
+        .filter(|e| e.enabled)
+        .map(|e| e.display_name.clone())
+        .collect();
+    preview_profile_against(state, name, all_on_disk, currently_enabled)
+}
+
 pub(crate) fn apply_profile(
     state: &Mutex<Settings>,
     name: &str,
@@ -222,7 +245,6 @@ pub(crate) fn apply_profile(
     let mut total_successes = 0u32;
     let mut total_failed = 0u32;
 
-    // Disable mods not in profile.
     if !diff.to_disable.is_empty() {
         let disable_full_names: Vec<String> = status
             .mod_entries
@@ -235,7 +257,6 @@ pub(crate) fn apply_profile(
         total_failed += res.failures.len() as u32;
     }
 
-    // Enable mods in profile.
     if !diff.to_enable.is_empty() {
         let enable_full_names: Vec<String> = status
             .mod_entries
@@ -255,6 +276,59 @@ pub(crate) fn apply_profile(
     })
 }
 
+fn session_preview_profile(
+    settings: &Mutex<Settings>,
+    session: &SessionLaunchState,
+    name: &str,
+    game_root: &str,
+    recursive: bool,
+) -> Result<ProfileDiff, String> {
+    let status = get_mods_status(game_root, recursive);
+    let all_on_disk = status
+        .mod_entries
+        .iter()
+        .map(|e| e.display_name.clone())
+        .collect();
+    let current = session_launch::selected_mods(session).into_iter().collect();
+    preview_profile_against(settings, name, all_on_disk, current)
+}
+
+fn session_apply_profile(
+    settings: &Mutex<Settings>,
+    session: &SessionLaunchState,
+    name: &str,
+    game_root: &str,
+    recursive: bool,
+) -> Result<ProfileApplyResult, String> {
+    let diff = session_preview_profile(settings, session, name, game_root, recursive)?;
+    let status = get_mods_status(game_root, recursive);
+    let all_on_disk: BTreeSet<String> = status
+        .mod_entries
+        .iter()
+        .map(|e| e.display_name.clone())
+        .collect();
+    let profile_mods: BTreeSet<String> = {
+        let guard = settings.lock().map_err(|e| e.to_string())?;
+        guard
+            .mod_profiles
+            .iter()
+            .find(|p| p.name == name)
+            .ok_or_else(|| format!("Profile \"{name}\" not found"))?
+            .enabled_mods
+            .iter()
+            .filter(|m| all_on_disk.contains(*m))
+            .cloned()
+            .collect()
+    };
+    let successes = (diff.to_enable.len() + diff.to_disable.len()) as u32;
+    session_launch::replace_selected_mods(session, profile_mods)?;
+    Ok(ProfileApplyResult {
+        successes,
+        failed: 0,
+        missing: diff.missing,
+    })
+}
+
 #[tauri::command]
 pub(crate) fn list_mod_profiles(
     state: State<'_, SettingsState>,
@@ -265,11 +339,17 @@ pub(crate) fn list_mod_profiles(
 #[tauri::command]
 pub(crate) fn save_mod_profile(
     state: State<'_, SettingsState>,
+    session: State<'_, SessionLaunchState>,
     name: String,
     game_root: String,
 ) -> Result<ModProfile, String> {
     let recursive = recursive_mod_scan(&state);
-    save_profile(&state, &name, &game_root, recursive)
+    if session_launch::is_enabled(&session) {
+        let enabled = session_launch::selected_mods(&session).into_iter().collect();
+        create_profile_from_enabled(&state, &name, enabled)
+    } else {
+        save_profile(&state, &name, &game_root, recursive)
+    }
 }
 
 #[tauri::command]
@@ -292,26 +372,38 @@ pub(crate) fn rename_mod_profile(
 #[tauri::command]
 pub(crate) fn overwrite_mod_profile(
     state: State<'_, SettingsState>,
+    session: State<'_, SessionLaunchState>,
     name: String,
     game_root: String,
 ) -> Result<ModProfile, String> {
     let recursive = recursive_mod_scan(&state);
-    overwrite_profile(&state, &name, &game_root, recursive)
+    if session_launch::is_enabled(&session) {
+        let enabled = session_launch::selected_mods(&session).into_iter().collect();
+        overwrite_profile_from_enabled(&state, &name, enabled)
+    } else {
+        overwrite_profile(&state, &name, &game_root, recursive)
+    }
 }
 
 #[tauri::command]
 pub(crate) fn preview_mod_profile(
     state: State<'_, SettingsState>,
+    session: State<'_, SessionLaunchState>,
     name: String,
     game_root: String,
 ) -> Result<ProfileDiff, String> {
     let recursive = recursive_mod_scan(&state);
-    preview_profile(&state, &name, &game_root, recursive)
+    if session_launch::is_enabled(&session) {
+        session_preview_profile(&state, &session, &name, &game_root, recursive)
+    } else {
+        preview_profile(&state, &name, &game_root, recursive)
+    }
 }
 
 #[tauri::command]
 pub(crate) fn apply_mod_profile(
     state: State<'_, SettingsState>,
+    session: State<'_, SessionLaunchState>,
     name: String,
     game_root: String,
 ) -> Result<ProfileApplyResult, String> {
@@ -319,5 +411,9 @@ pub(crate) fn apply_mod_profile(
         return Err(game_status::game_running_error());
     }
     let recursive = recursive_mod_scan(&state);
-    apply_profile(&state, &name, &game_root, recursive)
+    if session_launch::is_enabled(&session) {
+        session_apply_profile(&state, &session, &name, &game_root, recursive)
+    } else {
+        apply_profile(&state, &name, &game_root, recursive)
+    }
 }
