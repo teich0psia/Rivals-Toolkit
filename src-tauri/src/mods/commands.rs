@@ -201,7 +201,11 @@ pub(crate) fn delete_mods(
     let result = mods::delete_mods(&mods_folder, &full_names);
     if session_launch::is_enabled(&session) {
         for name in &full_names {
-            if !result.failures.iter().any(|failure| failure.full_name == *name) {
+            if !result
+                .failures
+                .iter()
+                .any(|failure| failure.full_name == *name)
+            {
                 session_launch::set_mod_selected(&session, name, false)?;
             }
         }

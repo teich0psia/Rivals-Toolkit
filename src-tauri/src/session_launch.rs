@@ -156,10 +156,7 @@ pub(crate) fn rename_selected_mod(
     })
 }
 
-pub(crate) fn set_bypass_selected(
-    state: &SessionLaunchState,
-    enabled: bool,
-) -> Result<(), String> {
+pub(crate) fn set_bypass_selected(state: &SessionLaunchState, enabled: bool) -> Result<(), String> {
     update_config(state, |config| config.bypass_enabled = enabled)
 }
 
@@ -180,10 +177,7 @@ pub(crate) fn decorate_status(state: &SessionLaunchState, status: &mut ModsStatu
     };
 }
 
-pub(crate) fn logical_bypass_kind(
-    state: &SessionLaunchState,
-    physical: BypassKind,
-) -> BypassKind {
+pub(crate) fn logical_bypass_kind(state: &SessionLaunchState, physical: BypassKind) -> BypassKind {
     let Ok(guard) = state.lock() else {
         return physical;
     };
@@ -287,11 +281,7 @@ fn clear_deployment(state: &SessionLaunchState) -> Result<(), String> {
 }
 
 fn cleanup_current_deployment(state: &SessionLaunchState) -> Result<(), String> {
-    let record = state
-        .lock()
-        .map_err(|e| e.to_string())?
-        .deployment
-        .clone();
+    let record = state.lock().map_err(|e| e.to_string())?.deployment.clone();
     if let Some(record) = record {
         cleanup_record(&record)?;
         clear_deployment(state)?;

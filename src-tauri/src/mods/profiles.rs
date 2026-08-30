@@ -345,7 +345,9 @@ pub(crate) fn save_mod_profile(
 ) -> Result<ModProfile, String> {
     let recursive = recursive_mod_scan(&state);
     if session_launch::is_enabled(&session) {
-        let enabled = session_launch::selected_mods(&session).into_iter().collect();
+        let enabled = session_launch::selected_mods(&session)
+            .into_iter()
+            .collect();
         create_profile_from_enabled(&state, &name, enabled)
     } else {
         save_profile(&state, &name, &game_root, recursive)
@@ -378,7 +380,9 @@ pub(crate) fn overwrite_mod_profile(
 ) -> Result<ModProfile, String> {
     let recursive = recursive_mod_scan(&state);
     if session_launch::is_enabled(&session) {
-        let enabled = session_launch::selected_mods(&session).into_iter().collect();
+        let enabled = session_launch::selected_mods(&session)
+            .into_iter()
+            .collect();
         overwrite_profile_from_enabled(&state, &name, enabled)
     } else {
         overwrite_profile(&state, &name, &game_root, recursive)
