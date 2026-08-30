@@ -69,6 +69,18 @@ fn save_config(config: &SessionLaunchConfig) -> Result<(), String> {
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
 }
 
+fn update_config(
+    state: &SessionLaunchState,
+    change: impl FnOnce(&mut SessionLaunchConfig),
+) -> Result<(), String> {
+    let mut guard = state.lock().map_err(|e| e.to_string())?;
+    let mut next = guard.clone();
+    change(&mut next);
+    save_config(&next)?;
+    *guard = next;
+    Ok(())
+}
+
 pub(crate) fn load_state() -> SessionLaunchState {
     Mutex::new(load_config())
 }
@@ -84,10 +96,6 @@ pub(crate) fn selected_mods(state: &SessionLaunchState) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-pub(crate) fn bypass_is_selected(state: &SessionLaunchState) -> bool {
-    state.lock().map(|s| s.bypass_enabled).unwrap_or(false)
-}
-
 fn display_name(full_name: &str) -> String {
     full_name
         .strip_suffix(".disabled")
@@ -101,13 +109,13 @@ pub(crate) fn set_mod_selected(
     enabled: bool,
 ) -> Result<(), String> {
     let name = display_name(full_or_display_name);
-    let mut guard = state.lock().map_err(|e| e.to_string())?;
-    if enabled {
-        guard.selected_mods.insert(name);
-    } else {
-        guard.selected_mods.remove(&name);
-    }
-    save_config(&guard)
+    update_config(state, |config| {
+        if enabled {
+            config.selected_mods.insert(name);
+        } else {
+            config.selected_mods.remove(&name);
+        }
+    })
 }
 
 pub(crate) fn set_mods_selected(
@@ -115,25 +123,23 @@ pub(crate) fn set_mods_selected(
     names: &[String],
     enabled: bool,
 ) -> Result<(), String> {
-    let mut guard = state.lock().map_err(|e| e.to_string())?;
-    for name in names {
-        let name = display_name(name);
-        if enabled {
-            guard.selected_mods.insert(name);
-        } else {
-            guard.selected_mods.remove(&name);
+    let names: Vec<String> = names.iter().map(|name| display_name(name)).collect();
+    update_config(state, |config| {
+        for name in names {
+            if enabled {
+                config.selected_mods.insert(name);
+            } else {
+                config.selected_mods.remove(&name);
+            }
         }
-    }
-    save_config(&guard)
+    })
 }
 
 pub(crate) fn replace_selected_mods(
     state: &SessionLaunchState,
     names: BTreeSet<String>,
 ) -> Result<(), String> {
-    let mut guard = state.lock().map_err(|e| e.to_string())?;
-    guard.selected_mods = names;
-    save_config(&guard)
+    update_config(state, |config| config.selected_mods = names)
 }
 
 pub(crate) fn rename_selected_mod(
@@ -143,21 +149,18 @@ pub(crate) fn rename_selected_mod(
 ) -> Result<(), String> {
     let old_name = display_name(old_full_name);
     let new_name = display_name(new_full_name);
-    let mut guard = state.lock().map_err(|e| e.to_string())?;
-    if guard.selected_mods.remove(&old_name) {
-        guard.selected_mods.insert(new_name);
-        save_config(&guard)?;
-    }
-    Ok(())
+    update_config(state, |config| {
+        if config.selected_mods.remove(&old_name) {
+            config.selected_mods.insert(new_name);
+        }
+    })
 }
 
 pub(crate) fn set_bypass_selected(
     state: &SessionLaunchState,
     enabled: bool,
 ) -> Result<(), String> {
-    let mut guard = state.lock().map_err(|e| e.to_string())?;
-    guard.bypass_enabled = enabled;
-    save_config(&guard)
+    update_config(state, |config| config.bypass_enabled = enabled)
 }
 
 pub(crate) fn decorate_status(state: &SessionLaunchState, status: &mut ModsStatus) {
@@ -210,7 +213,12 @@ fn deploy_selected_mods(
     let mut deployed = Vec::new();
     for entry in &status.mod_entries {
         if selected.contains(&entry.display_name) && !entry.enabled {
-            mods::toggle_mod_enabled(&status.mods_folder_path, &entry.full_name, true)?;
+            if let Err(e) =
+                mods::toggle_mod_enabled(&status.mods_folder_path, &entry.full_name, true)
+            {
+                let _ = disable_recorded_mods(game_root, &deployed);
+                return Err(e);
+            }
             deployed.push(entry.display_name.clone());
         }
     }
@@ -240,6 +248,32 @@ fn remove_physical_bypass_if_present(game_root: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn restore_session_idle(game_root: &str) -> Result<(), String> {
+    disable_all_physical_mods(game_root)?;
+    remove_physical_bypass_if_present(game_root)
+}
+
+fn restore_persistent_state(
+    game_root: &str,
+    selected: &BTreeSet<String>,
+    bypass_enabled: bool,
+) -> Result<(), String> {
+    disable_all_physical_mods(game_root)?;
+    remove_physical_bypass_if_present(game_root)?;
+    let deployed = deploy_selected_mods(game_root, selected)?;
+    let bypass_result = if bypass_enabled {
+        mods::install_signature_bypass(game_root).map(|_| ())
+    } else {
+        Ok(())
+    };
+    if let Err(e) = bypass_result {
+        let _ = disable_recorded_mods(game_root, &deployed);
+        let _ = remove_physical_bypass_if_present(game_root);
+        return Err(e);
+    }
+    Ok(())
+}
+
 fn cleanup_record(record: &DeploymentRecord) -> Result<(), String> {
     disable_recorded_mods(&record.game_root, &record.deployed_mods)?;
     if record.bypass_deployed {
@@ -249,9 +283,7 @@ fn cleanup_record(record: &DeploymentRecord) -> Result<(), String> {
 }
 
 fn clear_deployment(state: &SessionLaunchState) -> Result<(), String> {
-    let mut guard = state.lock().map_err(|e| e.to_string())?;
-    guard.deployment = None;
-    save_config(&guard)
+    update_config(state, |config| config.deployment = None)
 }
 
 fn cleanup_current_deployment(state: &SessionLaunchState) -> Result<(), String> {
@@ -283,6 +315,13 @@ fn set_mode(state: &SessionLaunchState, game_root: &str, enabled: bool) -> Resul
     if crate::game_status::is_game_running() {
         return Err("Close Marvel Rivals before changing session launch mode.".to_string());
     }
+    if is_enabled(state) == enabled {
+        return Ok(if enabled {
+            "Session launch is already enabled.".to_string()
+        } else {
+            "Session launch is already disabled.".to_string()
+        });
+    }
 
     if enabled {
         let physical = mods::get_mods_status(game_root, true);
@@ -294,15 +333,21 @@ fn set_mode(state: &SessionLaunchState, game_root: &str, enabled: bool) -> Resul
             .collect();
         let bypass_enabled = physical.sig_bypass_kind != BypassKind::None;
 
-        disable_all_physical_mods(game_root)?;
-        remove_physical_bypass_if_present(game_root)?;
+        if let Err(e) = restore_session_idle(game_root) {
+            let _ = restore_persistent_state(game_root, &selected, bypass_enabled);
+            return Err(e);
+        }
 
-        let mut guard = state.lock().map_err(|e| e.to_string())?;
-        guard.enabled = true;
-        guard.selected_mods = selected;
-        guard.bypass_enabled = bypass_enabled;
-        guard.deployment = None;
-        save_config(&guard)?;
+        let save_result = update_config(state, |config| {
+            config.enabled = true;
+            config.selected_mods = selected.clone();
+            config.bypass_enabled = bypass_enabled;
+            config.deployment = None;
+        });
+        if let Err(e) = save_result {
+            let _ = restore_persistent_state(game_root, &selected, bypass_enabled);
+            return Err(e);
+        }
         Ok("Session launch enabled. Toolkit-managed mods are now inactive at rest.".to_string())
     } else {
         let (selected, bypass_enabled) = {
@@ -310,18 +355,14 @@ fn set_mode(state: &SessionLaunchState, game_root: &str, enabled: bool) -> Resul
             (guard.selected_mods.clone(), guard.bypass_enabled)
         };
 
-        disable_all_physical_mods(game_root)?;
-        let _ = deploy_selected_mods(game_root, &selected)?;
-        if bypass_enabled {
-            mods::install_signature_bypass(game_root)?;
-        } else {
-            remove_physical_bypass_if_present(game_root)?;
+        restore_persistent_state(game_root, &selected, bypass_enabled)?;
+        if let Err(e) = update_config(state, |config| {
+            config.enabled = false;
+            config.deployment = None;
+        }) {
+            let _ = restore_session_idle(game_root);
+            return Err(e);
         }
-
-        let mut guard = state.lock().map_err(|e| e.to_string())?;
-        guard.enabled = false;
-        guard.deployment = None;
-        save_config(&guard)?;
         Ok("Session launch disabled. Persistent upstream-style mod state restored.".to_string())
     }
 }
@@ -341,9 +382,16 @@ pub(crate) fn set_session_launch_enabled(
 }
 
 fn prepare_deployment(state: &SessionLaunchState, game_root: &str) -> Result<(), String> {
-    disable_all_physical_mods(game_root)?;
-    remove_physical_bypass_if_present(game_root)?;
+    if state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .deployment
+        .is_some()
+    {
+        return Err("A session launch is already pending.".to_string());
+    }
 
+    restore_session_idle(game_root)?;
     let (selected, bypass_enabled) = {
         let guard = state.lock().map_err(|e| e.to_string())?;
         (guard.selected_mods.clone(), guard.bypass_enabled)
@@ -352,17 +400,23 @@ fn prepare_deployment(state: &SessionLaunchState, game_root: &str) -> Result<(),
     let deployed_mods = deploy_selected_mods(game_root, &selected)?;
     let mut bypass_deployed = false;
     if bypass_enabled {
-        mods::install_signature_bypass(game_root)?;
+        if let Err(e) = mods::install_signature_bypass(game_root) {
+            let _ = disable_recorded_mods(game_root, &deployed_mods);
+            return Err(e);
+        }
         bypass_deployed = true;
     }
 
-    let mut guard = state.lock().map_err(|e| e.to_string())?;
-    guard.deployment = Some(DeploymentRecord {
+    let record = DeploymentRecord {
         game_root: game_root.to_string(),
         deployed_mods,
         bypass_deployed,
-    });
-    save_config(&guard)
+    };
+    if let Err(e) = update_config(state, |config| config.deployment = Some(record.clone())) {
+        let _ = cleanup_record(&record);
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn spawn_watchdog(game_root: &str) -> Result<(), String> {
