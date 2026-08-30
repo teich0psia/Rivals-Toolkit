@@ -1,5 +1,7 @@
 //! Tauri commands for mod install, toggle, export, delete, and status queries.
 
+use std::path::Path;
+
 use tauri::{AppHandle, Manager, State};
 
 use crate::game_status;
@@ -9,6 +11,13 @@ use crate::mods::heroes::enrich_status_with_heroes;
 use crate::mods::{BulkOpResult, ConflictReport, InstallResult, ModsStatus};
 use crate::session_launch::{self, SessionLaunchState};
 use crate::settings::{SettingsState, recursive_mod_scan};
+
+fn disable_new_install(mods_folder: &str, file_name: &str) -> Result<(), String> {
+    if Path::new(mods_folder).join(file_name).exists() {
+        mods::toggle_mod_enabled(mods_folder, file_name, false)?;
+    }
+    Ok(())
+}
 
 #[tauri::command]
 pub(crate) async fn get_mods_status(
@@ -36,13 +45,9 @@ pub(crate) async fn check_mod_conflicts(
     game_root: String,
 ) -> Result<ConflictReport, String> {
     if session_launch::is_enabled(&session) {
-        // Session-selected mods are intentionally disabled on disk while idle. Avoid presenting a
-        // false physical-state conflict result until conflict scanning accepts a logical selection.
-        return Ok(ConflictReport {
-            groups: Vec::new(),
-            asset_conflicts: Vec::new(),
-            mods_scanned: 0,
-        });
+        return Err(
+            "Conflict checking is unavailable while Session launch is enabled.".to_string(),
+        );
     }
     let recursive = recursive_mod_scan(&state);
     tauri::async_runtime::spawn_blocking(move || mods::check_conflicts(&game_root, recursive))
@@ -224,7 +229,9 @@ pub(crate) fn install_mod(
     }
     let result = mods::install_mod(&mods_folder, &source_path)?;
     if session_launch::is_enabled(&session) {
-        mods::toggle_mod_enabled(&mods_folder, &result.file_name, false)?;
+        disable_new_install(&mods_folder, &result.file_name).map_err(|e| {
+            format!("Mod installed but could not be returned to the Session launch idle state: {e}")
+        })?;
         session_launch::set_mod_selected(&session, &result.file_name, true)?;
     }
     Ok(result)
@@ -248,9 +255,17 @@ pub(crate) async fn install_from_archive(
 
     if session_launch::is_enabled(&session) {
         for result in &results {
-            mods::toggle_mod_enabled(&mods_folder, &result.file_name, false)?;
-            session_launch::set_mod_selected(&session, &result.file_name, true)?;
+            if let Err(e) = disable_new_install(&mods_folder, &result.file_name) {
+                for installed in &results {
+                    let _ = disable_new_install(&mods_folder, &installed.file_name);
+                }
+                return Err(format!(
+                    "Archive installed but could not be returned to the Session launch idle state: {e}"
+                ));
+            }
         }
+        let names: Vec<String> = results.iter().map(|result| result.file_name.clone()).collect();
+        session_launch::set_mods_selected(&session, &names, true)?;
     }
     Ok(results)
 }
