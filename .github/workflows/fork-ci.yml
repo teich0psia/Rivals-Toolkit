@@ -32,6 +32,8 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -43,8 +45,11 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Format check
-        run: pnpm format:check
+      - name: Frontend format check
+        run: pnpm format:web:check
+
+      - name: Rust format check
+        run: pnpm format:rust:check
 
       - name: Lint
         run: pnpm lint
