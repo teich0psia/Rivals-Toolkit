@@ -13,6 +13,7 @@ mod pak;
 mod pak_tweaks;
 mod paths;
 mod session_launch;
+mod session_profiles;
 mod settings;
 mod sounds;
 mod tweaks;
