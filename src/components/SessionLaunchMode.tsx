@@ -42,7 +42,7 @@ export function SessionLaunchMode({ gamePath, gameRunning }: Props) {
       setEnabled(next);
       emitModsChanged({
         modsFolder: `${gamePath}\\MarvelGame\\Marvel\\Content\\Paks\\~mods`,
-        source: "SessionLaunchMode",
+        source: "Settings",
       });
     } catch (e) {
       setError(String(e));
