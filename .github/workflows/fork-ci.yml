@@ -51,6 +51,9 @@ jobs:
       - name: Rust format check
         run: pnpm format:rust:check
 
+      - name: Test
+        run: cargo test --workspace
+
       - name: Type check
         run: pnpm exec tsc --noEmit
 

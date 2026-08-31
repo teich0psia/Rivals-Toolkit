@@ -8,8 +8,8 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::mods::get_mods_status;
 use crate::mods::profiles::{ProfileApplyResult, ProfileDiff};
-use crate::mods::status::get_mods_status;
 use crate::session_launch::{SessionLaunchState, replace_selected_mods, selected_mods};
 use crate::settings::{ModProfile, Settings};
 

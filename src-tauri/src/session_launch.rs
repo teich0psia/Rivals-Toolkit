@@ -5,7 +5,7 @@
 //! state after the shipping process exits.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,7 +16,8 @@ use tauri::{AppHandle, Manager, State};
 use crate::detect::InstallInfo;
 use crate::mods::{self, BypassKind, ModsStatus};
 
-const FILE_NAME: &str = "session-launch.json";
+const CONFIG_FILE_NAME: &str = "session-launch.json";
+const DEPLOYMENT_FILE_NAME: &str = "session-deployment.json";
 const WATCHDOG_ARG: &str = "--rivals-toolkit-session-watchdog";
 const START_TIMEOUT: Duration = Duration::from_secs(180);
 const POLL_INTERVAL: Duration = Duration::from_millis(750);
@@ -27,11 +28,35 @@ struct DeploymentRecord {
     #[serde(default)]
     deployed_mods: Vec<String>,
     #[serde(default)]
+    bypass_loader_deployed: bool,
+    #[serde(default)]
+    bypass_payload_deployed: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct LegacyDeploymentRecord {
+    game_root: String,
+    #[serde(default)]
+    deployed_mods: Vec<String>,
+    #[serde(default)]
     bypass_deployed: bool,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub(crate) struct SessionLaunchConfig {
+impl From<LegacyDeploymentRecord> for DeploymentRecord {
+    fn from(legacy: LegacyDeploymentRecord) -> Self {
+        Self {
+            game_root: legacy.game_root,
+            deployed_mods: legacy.deployed_mods,
+            // The old session path removed all bypass files before deployment, so a successful
+            // legacy bypass deployment necessarily owned both files it then installed.
+            bypass_loader_deployed: legacy.bypass_deployed,
+            bypass_payload_deployed: legacy.bypass_deployed,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct StoredSessionLaunchConfig {
     #[serde(default)]
     enabled: bool,
     #[serde(default)]
@@ -39,34 +64,123 @@ pub(crate) struct SessionLaunchConfig {
     #[serde(default)]
     bypass_enabled: bool,
     #[serde(default)]
-    deployment: Option<DeploymentRecord>,
+    deployment: Option<LegacyDeploymentRecord>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct SessionLaunchConfig {
+    enabled: bool,
+    selected_mods: BTreeSet<String>,
+    bypass_enabled: bool,
 }
 
 pub(crate) type SessionLaunchState = Mutex<SessionLaunchConfig>;
 
-fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("rivals-toolkit").join(FILE_NAME))
+fn config_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("rivals-toolkit"))
 }
 
-fn load_config() -> SessionLaunchConfig {
+fn config_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join(CONFIG_FILE_NAME))
+}
+
+fn deployment_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join(DEPLOYMENT_FILE_NAME))
+}
+
+fn replace_file(tmp: &Path, path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    if path.exists() {
+        std::fs::remove_file(path).map_err(|e| e.to_string())?;
+    }
+
+    std::fs::rename(tmp, path).map_err(|e| e.to_string())
+}
+
+fn write_json_replacing<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    replace_file(&tmp, path)
+}
+
+fn write_json_new<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    if path.exists() {
+        return Err("A session launch is already pending.".to_string());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e.to_string())
+        }
+    }
+}
+
+fn parse_config(text: &str) -> Result<(SessionLaunchConfig, Option<DeploymentRecord>), String> {
+    let stored: StoredSessionLaunchConfig =
+        serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let config = SessionLaunchConfig {
+        enabled: stored.enabled,
+        selected_mods: stored.selected_mods,
+        bypass_enabled: stored.bypass_enabled,
+    };
+    Ok((config, stored.deployment.map(Into::into)))
+}
+
+fn load_config() -> (SessionLaunchConfig, Option<DeploymentRecord>) {
     let Some(path) = config_path() else {
-        return SessionLaunchConfig::default();
+        return (SessionLaunchConfig::default(), None);
     };
     let Ok(text) = std::fs::read_to_string(path) else {
-        return SessionLaunchConfig::default();
+        return (SessionLaunchConfig::default(), None);
     };
-    serde_json::from_str(&text).unwrap_or_default()
+    parse_config(&text).unwrap_or_default()
 }
 
 fn save_config(config: &SessionLaunchConfig) -> Result<(), String> {
     let path = config_path().ok_or_else(|| "Could not resolve config directory".to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    write_json_replacing(&path, config)
+}
+
+fn load_deployment() -> Result<Option<DeploymentRecord>, String> {
+    let path = deployment_path().ok_or_else(|| "Could not resolve config directory".to_string())?;
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text).map(Some).map_err(|e| {
+            format!(
+                "Could not parse session deployment record {}: {e}",
+                path.display()
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "Could not read session deployment record {}: {e}",
+            path.display()
+        )),
     }
-    let json = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+}
+
+fn save_deployment(record: &DeploymentRecord) -> Result<(), String> {
+    let path = deployment_path().ok_or_else(|| "Could not resolve config directory".to_string())?;
+    write_json_new(&path, record)
+}
+
+fn clear_deployment() -> Result<(), String> {
+    let path = deployment_path().ok_or_else(|| "Could not resolve config directory".to_string())?;
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn update_config(
@@ -82,7 +196,18 @@ fn update_config(
 }
 
 pub(crate) fn load_state() -> SessionLaunchState {
-    Mutex::new(load_config())
+    let (config, legacy_deployment) = load_config();
+    if let Some(legacy) = legacy_deployment {
+        let migrated = match load_deployment() {
+            Ok(Some(_)) => true,
+            Ok(None) => save_deployment(&legacy).is_ok(),
+            Err(_) => false,
+        };
+        if migrated {
+            let _ = save_config(&config);
+        }
+    }
+    Mutex::new(config)
 }
 
 pub(crate) fn is_enabled(state: &SessionLaunchState) -> bool {
@@ -235,16 +360,9 @@ fn disable_recorded_mods(game_root: &str, deployed: &[String]) -> Result<(), Str
     Ok(())
 }
 
-fn remove_physical_bypass_if_present(game_root: &str) -> Result<(), String> {
-    if mods::signature_bypass_kind(game_root) != BypassKind::None {
-        mods::remove_signature_bypass(game_root)?;
-    }
-    Ok(())
-}
-
 fn restore_session_idle(game_root: &str) -> Result<(), String> {
-    disable_all_physical_mods(game_root)?;
-    remove_physical_bypass_if_present(game_root)
+    mods::remove_session_signature_bypass_at_rest(game_root)?;
+    disable_all_physical_mods(game_root)
 }
 
 fn restore_persistent_state(
@@ -252,17 +370,16 @@ fn restore_persistent_state(
     selected: &BTreeSet<String>,
     bypass_enabled: bool,
 ) -> Result<(), String> {
-    disable_all_physical_mods(game_root)?;
-    remove_physical_bypass_if_present(game_root)?;
+    restore_session_idle(game_root)?;
     let deployed = deploy_selected_mods(game_root, selected)?;
     let bypass_result = if bypass_enabled {
-        mods::install_signature_bypass(game_root).map(|_| ())
+        mods::deploy_session_signature_bypass(game_root).map(|_| ())
     } else {
         Ok(())
     };
     if let Err(e) = bypass_result {
         let _ = disable_recorded_mods(game_root, &deployed);
-        let _ = remove_physical_bypass_if_present(game_root);
+        let _ = mods::remove_session_signature_bypass_at_rest(game_root);
         return Err(e);
     }
     Ok(())
@@ -270,40 +387,45 @@ fn restore_persistent_state(
 
 fn cleanup_record(record: &DeploymentRecord) -> Result<(), String> {
     disable_recorded_mods(&record.game_root, &record.deployed_mods)?;
-    if record.bypass_deployed {
-        remove_physical_bypass_if_present(&record.game_root)?;
-    }
-    Ok(())
+    mods::cleanup_session_signature_bypass(
+        &record.game_root,
+        record.bypass_loader_deployed,
+        record.bypass_payload_deployed,
+    )
 }
 
-fn clear_deployment(state: &SessionLaunchState) -> Result<(), String> {
-    update_config(state, |config| config.deployment = None)
-}
-
-fn cleanup_current_deployment(state: &SessionLaunchState) -> Result<(), String> {
-    let record = state.lock().map_err(|e| e.to_string())?.deployment.clone();
-    if let Some(record) = record {
+fn cleanup_current_deployment() -> Result<(), String> {
+    if let Some(record) = load_deployment()? {
         cleanup_record(&record)?;
-        clear_deployment(state)?;
+        clear_deployment()?;
     }
     Ok(())
 }
 
-pub(crate) fn recover_or_resume(state: &SessionLaunchState) {
-    let record = state.lock().ok().and_then(|s| s.deployment.clone());
+pub(crate) fn recover_or_resume(_state: &SessionLaunchState) {
+    let record = match load_deployment() {
+        Ok(record) => record,
+        Err(e) => {
+            eprintln!("rivals-toolkit: {e}");
+            return;
+        }
+    };
     let Some(record) = record else {
         return;
     };
     if crate::game_status::is_game_running() {
         let _ = spawn_watchdog(&record.game_root);
     } else if cleanup_record(&record).is_ok() {
-        let _ = clear_deployment(state);
+        let _ = clear_deployment();
     }
 }
 
 fn set_mode(state: &SessionLaunchState, game_root: &str, enabled: bool) -> Result<String, String> {
     if crate::game_status::is_game_running() {
         return Err("Close Marvel Rivals before changing session launch mode.".to_string());
+    }
+    if load_deployment()?.is_some() {
+        return Err("A session launch is already pending.".to_string());
     }
     if is_enabled(state) == enabled {
         return Ok(if enabled {
@@ -314,14 +436,21 @@ fn set_mode(state: &SessionLaunchState, game_root: &str, enabled: bool) -> Resul
     }
 
     if enabled {
+        mods::validate_session_signature_bypass(game_root)?;
         let physical = mods::get_mods_status(game_root, true);
+        if physical.sig_bypass_kind == BypassKind::Outdated {
+            return Err(
+                "Session launch cannot manage the legacy signature bypass. Update or remove it first."
+                    .to_string(),
+            );
+        }
         let selected: BTreeSet<String> = physical
             .mod_entries
             .iter()
             .filter(|e| e.enabled)
             .map(|e| e.display_name.clone())
             .collect();
-        let bypass_enabled = physical.sig_bypass_kind != BypassKind::None;
+        let bypass_enabled = physical.sig_bypass_kind == BypassKind::Installed;
 
         if let Err(e) = restore_session_idle(game_root) {
             let _ = restore_persistent_state(game_root, &selected, bypass_enabled);
@@ -332,7 +461,6 @@ fn set_mode(state: &SessionLaunchState, game_root: &str, enabled: bool) -> Resul
             config.enabled = true;
             config.selected_mods = selected.clone();
             config.bypass_enabled = bypass_enabled;
-            config.deployment = None;
         });
         if let Err(e) = save_result {
             let _ = restore_persistent_state(game_root, &selected, bypass_enabled);
@@ -346,10 +474,7 @@ fn set_mode(state: &SessionLaunchState, game_root: &str, enabled: bool) -> Resul
         };
 
         restore_persistent_state(game_root, &selected, bypass_enabled)?;
-        if let Err(e) = update_config(state, |config| {
-            config.enabled = false;
-            config.deployment = None;
-        }) {
+        if let Err(e) = update_config(state, |config| config.enabled = false) {
             let _ = restore_session_idle(game_root);
             return Err(e);
         }
@@ -372,12 +497,7 @@ pub(crate) fn set_session_launch_enabled(
 }
 
 fn prepare_deployment(state: &SessionLaunchState, game_root: &str) -> Result<(), String> {
-    if state
-        .lock()
-        .map_err(|e| e.to_string())?
-        .deployment
-        .is_some()
-    {
+    if load_deployment()?.is_some() {
         return Err("A session launch is already pending.".to_string());
     }
 
@@ -388,21 +508,25 @@ fn prepare_deployment(state: &SessionLaunchState, game_root: &str) -> Result<(),
     };
 
     let deployed_mods = deploy_selected_mods(game_root, &selected)?;
-    let mut bypass_deployed = false;
-    if bypass_enabled {
-        if let Err(e) = mods::install_signature_bypass(game_root) {
-            let _ = disable_recorded_mods(game_root, &deployed_mods);
-            return Err(e);
+    let (bypass_loader_deployed, bypass_payload_deployed) = if bypass_enabled {
+        match mods::deploy_session_signature_bypass(game_root) {
+            Ok(deployment) => deployment,
+            Err(e) => {
+                let _ = disable_recorded_mods(game_root, &deployed_mods);
+                return Err(e);
+            }
         }
-        bypass_deployed = true;
-    }
+    } else {
+        (false, false)
+    };
 
     let record = DeploymentRecord {
         game_root: game_root.to_string(),
         deployed_mods,
-        bypass_deployed,
+        bypass_loader_deployed,
+        bypass_payload_deployed,
     };
-    if let Err(e) = update_config(state, |config| config.deployment = Some(record.clone())) {
+    if let Err(e) = save_deployment(&record) {
         let _ = cleanup_record(&record);
         return Err(e);
     }
@@ -430,11 +554,11 @@ pub(crate) fn launch_game(app: &AppHandle, install_info: InstallInfo) -> Result<
 
     prepare_deployment(&state, &install_info.path)?;
     if let Err(e) = install_info.launch_game() {
-        let _ = cleanup_current_deployment(&state);
+        let _ = cleanup_current_deployment();
         return Err(e);
     }
     if let Err(e) = spawn_watchdog(&install_info.path) {
-        let _ = cleanup_current_deployment(&state);
+        let _ = cleanup_current_deployment();
         return Err(e);
     }
     Ok(())
@@ -451,11 +575,16 @@ fn watchdog_main(game_root: &str) {
         }
     }
 
-    let state = load_state();
-    let record = state.lock().ok().and_then(|s| s.deployment.clone());
+    let record = match load_deployment() {
+        Ok(record) => record,
+        Err(e) => {
+            eprintln!("rivals-toolkit watchdog: {e}");
+            return;
+        }
+    };
     if let Some(record) = record.filter(|r| r.game_root == game_root) {
         if cleanup_record(&record).is_ok() {
-            let _ = clear_deployment(&state);
+            let _ = clear_deployment();
         }
     }
 }
@@ -474,13 +603,85 @@ pub(crate) fn run_watchdog_from_args() -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
-    use super::display_name;
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn scratch_path(file_name: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!(
+                "rivals-session-test-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ))
+            .join(file_name)
+    }
 
     #[test]
     fn display_name_strips_only_disabled_suffix() {
         assert_eq!(display_name("Foo.pak.disabled"), "Foo.pak");
         assert_eq!(display_name("Foo.pak"), "Foo.pak");
         assert_eq!(display_name("sub/Foo.pak.disabled"), "sub/Foo.pak");
+    }
+
+    #[test]
+    fn legacy_deployment_is_migrated_out_of_config() {
+        let json = r#"{
+            "enabled": true,
+            "selected_mods": ["Foo.pak"],
+            "bypass_enabled": true,
+            "deployment": {
+                "game_root": "C:/Game",
+                "deployed_mods": ["Foo.pak"],
+                "bypass_deployed": true
+            }
+        }"#;
+        let (config, deployment) = parse_config(json).expect("parse legacy config");
+        let deployment = deployment.expect("legacy deployment");
+
+        assert!(config.enabled);
+        assert!(config.selected_mods.contains("Foo.pak"));
+        assert!(config.bypass_enabled);
+        assert_eq!(deployment.game_root, "C:/Game");
+        assert!(deployment.bypass_loader_deployed);
+        assert!(deployment.bypass_payload_deployed);
+        assert!(
+            !serde_json::to_string(&config)
+                .expect("serialize config")
+                .contains("deployment")
+        );
+    }
+
+    #[test]
+    fn replacing_json_file_supports_repeated_saves() {
+        let path = scratch_path("state.json");
+        write_json_replacing(&path, &serde_json::json!({ "value": 1 })).expect("first write");
+        write_json_replacing(&path, &serde_json::json!({ "value": 2 })).expect("second write");
+
+        let text = std::fs::read_to_string(&path).expect("read state");
+        assert!(text.contains('2'));
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    #[test]
+    fn deployment_file_creation_rejects_an_existing_record() {
+        let path = scratch_path("deployment.json");
+        let first = DeploymentRecord {
+            game_root: "A".to_string(),
+            ..DeploymentRecord::default()
+        };
+        let second = DeploymentRecord {
+            game_root: "B".to_string(),
+            ..DeploymentRecord::default()
+        };
+
+        write_json_new(&path, &first).expect("first deployment");
+        assert!(write_json_new(&path, &second).is_err());
+        let text = std::fs::read_to_string(&path).expect("read deployment");
+        assert!(text.contains("\"A\""));
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
     }
 }

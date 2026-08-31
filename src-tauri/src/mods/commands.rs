@@ -264,7 +264,10 @@ pub(crate) async fn install_from_archive(
                 ));
             }
         }
-        let names: Vec<String> = results.iter().map(|result| result.file_name.clone()).collect();
+        let names: Vec<String> = results
+            .iter()
+            .map(|result| result.file_name.clone())
+            .collect();
         session_launch::set_mods_selected(&session, &names, true)?;
     }
     Ok(results)
