@@ -12,11 +12,17 @@ mod mods;
 mod pak;
 mod pak_tweaks;
 mod paths;
+mod session_launch;
+mod session_profiles;
 mod settings;
 mod sounds;
 mod tweaks;
 mod update_check;
 mod updater;
+
+pub fn run_session_watchdog_from_args() -> bool {
+    session_launch::run_watchdog_from_args()
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 #[allow(clippy::expect_used)]
@@ -25,10 +31,13 @@ pub fn run() {
     updater::cleanup_stale_update_files();
     let loaded_settings = settings::Settings::load();
     game_status::set_check_enabled(loaded_settings.game_running_check_enabled);
+    let session_launch_state = session_launch::load_state();
+    session_launch::recover_or_resume(&session_launch_state);
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage::<settings::SettingsState>(std::sync::Mutex::new(loaded_settings))
+        .manage::<session_launch::SessionLaunchState>(session_launch_state)
         .manage::<mods::hero_cache::HeroCacheState>(std::sync::Mutex::new(
             mods::hero_cache::HeroCache::load(),
         ))
@@ -36,6 +45,9 @@ pub fn run() {
             // detect
             detect::detect_install_path,
             detect::launch_game,
+            // session launch (fork)
+            session_launch::get_session_launch_enabled,
+            session_launch::set_session_launch_enabled,
             // paths
             paths::validate_game_path,
             paths::path_exists,

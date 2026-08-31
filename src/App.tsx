@@ -16,6 +16,7 @@ import { AssetManager } from "./components/AssetManager";
 import { ConfigTweaks } from "./components/ConfigTweaks";
 import { Mods } from "./components/Mods";
 import { PakIniEditor } from "./components/PakIniEditor";
+import { SessionLaunchMode } from "./components/SessionLaunchMode";
 import { Settings } from "./components/Settings";
 import { Sounds } from "./components/Sounds";
 import { Titlebar } from "./components/Titlebar";
@@ -202,6 +203,7 @@ function App() {
             </ul>
 
             <div className="px-2 pb-2">
+              <SessionLaunchMode gamePath={gamePath} gameRunning={gameRunning} />
               <Tip
                 content={
                   !gameStatusReady

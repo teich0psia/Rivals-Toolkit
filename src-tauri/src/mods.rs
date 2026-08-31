@@ -62,6 +62,26 @@ pub(crate) fn remove_signature_bypass(game_root: &str) -> Result<String, String>
     bypass::remove_signature_bypass(game_root)
 }
 
+pub(crate) fn validate_session_signature_bypass(game_root: &str) -> Result<(), String> {
+    bypass::validate_session_signature_bypass(game_root)
+}
+
+pub(crate) fn remove_session_signature_bypass_at_rest(game_root: &str) -> Result<(), String> {
+    bypass::remove_session_signature_bypass_at_rest(game_root)
+}
+
+pub(crate) fn deploy_session_signature_bypass(game_root: &str) -> Result<(bool, bool), String> {
+    bypass::deploy_session_signature_bypass(game_root)
+}
+
+pub(crate) fn cleanup_session_signature_bypass(
+    game_root: &str,
+    loader_deployed: bool,
+    payload_deployed: bool,
+) -> Result<(), String> {
+    bypass::cleanup_session_signature_bypass(game_root, loader_deployed, payload_deployed)
+}
+
 pub(crate) fn is_signature_bypass_installed(game_root: &str) -> bool {
     bypass::is_signature_bypass_installed(game_root)
 }

@@ -51,6 +51,27 @@ fn loader_matches_any(loader_dll: &std::path::Path, hashes: &[&str]) -> bool {
     hashes.contains(&digest.as_str())
 }
 
+fn file_matches(path: &std::path::Path, expected: &[u8]) -> Result<bool, String> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(bytes == expected),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("read {}: {e}", path.display())),
+    }
+}
+
+fn ensure_bundled_bypass_available() -> Result<(), String> {
+    if BYPASS_ASI_LOADER.starts_with(b"MZ") && BYPASS_PAYLOAD_ASI.starts_with(b"MZ") {
+        return Ok(());
+    }
+    Err(
+        "Bundled bypass binaries are placeholders. Put oxiloader's dsound.dll \
+         (from the oZanderr/oxiloader release) and the original \
+         MarvelRivalsUTOCSignatureBypass.asi into src-tauri/resources/bypass/, \
+         then rebuild the app."
+            .to_string(),
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum BypassKind {
@@ -74,6 +95,18 @@ fn bypass_paths(game_root: &str) -> BypassPaths {
         payload_asi: plugins.join(PAYLOAD_ASI_FILENAME),
         superseded_dll: bin_dir.join(SUPERSEDED_DLL_FILENAME),
         superseded_asi: plugins.join(SUPERSEDED_ASI_FILENAME),
+    }
+}
+
+fn cleanup_empty_plugins_dir(game_root: &str) {
+    let plugins = binaries_dir(game_root).join("plugins");
+    if plugins.is_dir()
+        && plugins
+            .read_dir()
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false)
+    {
+        let _ = fs::remove_dir(&plugins);
     }
 }
 
@@ -101,16 +134,135 @@ pub(crate) fn is_signature_bypass_installed(game_root: &str) -> bool {
     bypass_install_kind(game_root) != BypassKind::None
 }
 
-pub(crate) fn install_signature_bypass(game_root: &str) -> Result<String, String> {
-    if !BYPASS_ASI_LOADER.starts_with(b"MZ") || !BYPASS_PAYLOAD_ASI.starts_with(b"MZ") {
+pub(crate) fn validate_session_signature_bypass(game_root: &str) -> Result<(), String> {
+    let paths = bypass_paths(game_root);
+    if paths.superseded_dll.exists() || paths.superseded_asi.exists() {
         return Err(
-            "Bundled bypass binaries are placeholders. Put oxiloader's dsound.dll \
-             (from the oZanderr/oxiloader release) and the original \
-             MarvelRivalsUTOCSignatureBypass.asi into src-tauri/resources/bypass/, \
-             then rebuild the app."
+            "Session launch cannot manage the legacy signature bypass. Update or remove it first."
                 .to_string(),
         );
     }
+    if paths.payload_asi.exists() && !file_matches(&paths.payload_asi, BYPASS_PAYLOAD_ASI)? {
+        return Err(format!(
+            "Session launch will not replace the custom bypass payload at {}.",
+            paths.payload_asi.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Return the bypass to the session-mode idle state without deleting a third-party loader.
+/// Only loader/payload files whose contents match Toolkit-managed builds are removed.
+pub(crate) fn remove_session_signature_bypass_at_rest(game_root: &str) -> Result<(), String> {
+    validate_session_signature_bypass(game_root)?;
+    let paths = bypass_paths(game_root);
+
+    if paths.payload_asi.exists() {
+        fs::remove_file(&paths.payload_asi)
+            .map_err(|e| format!("remove {}: {e}", paths.payload_asi.display()))?;
+    }
+
+    if paths.loader_dll.exists()
+        && (file_matches(&paths.loader_dll, BYPASS_ASI_LOADER)?
+            || loader_is_superseded(&paths.loader_dll))
+    {
+        fs::remove_file(&paths.loader_dll)
+            .map_err(|e| format!("remove {}: {e}", paths.loader_dll.display()))?;
+    }
+
+    cleanup_empty_plugins_dir(game_root);
+    Ok(())
+}
+
+/// Deploy the bypass for one Toolkit-owned session. The returned booleans record whether this
+/// call created the loader and payload, so cleanup can avoid deleting files it did not deploy.
+pub(crate) fn deploy_session_signature_bypass(game_root: &str) -> Result<(bool, bool), String> {
+    ensure_bundled_bypass_available()?;
+    validate_session_signature_bypass(game_root)?;
+
+    let bin_dir = binaries_dir(game_root);
+    if !bin_dir.exists() {
+        return Err(format!(
+            "Binaries directory not found: {}\nMake sure the game root path is correct.",
+            bin_dir.display()
+        ));
+    }
+
+    let paths = bypass_paths(game_root);
+    if paths.payload_asi.exists() {
+        return Err("Session bypass payload is already present before deployment.".to_string());
+    }
+
+    let loader_deployed = if paths.loader_dll.exists() {
+        if file_matches(&paths.loader_dll, BYPASS_ASI_LOADER)?
+            || loader_is_superseded(&paths.loader_dll)
+        {
+            return Err(
+                "Toolkit-managed bypass loader is already present before deployment.".to_string(),
+            );
+        }
+        false
+    } else {
+        fs::write(&paths.loader_dll, BYPASS_ASI_LOADER)
+            .map_err(|e| format!("write {LOADER_DLL_FILENAME}: {e}"))?;
+        true
+    };
+
+    let install_payload = || -> Result<(), String> {
+        if let Some(plugins) = paths.payload_asi.parent() {
+            fs::create_dir_all(plugins).map_err(|e| format!("create plugins dir: {e}"))?;
+        }
+        fs::write(&paths.payload_asi, BYPASS_PAYLOAD_ASI)
+            .map_err(|e| format!("write {PAYLOAD_ASI_FILENAME}: {e}"))?;
+        if !mods_dir(game_root).exists() {
+            fs::create_dir_all(mods_dir(game_root)).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    };
+
+    if let Err(e) = install_payload() {
+        let _ = fs::remove_file(&paths.payload_asi);
+        if loader_deployed {
+            let _ = fs::remove_file(&paths.loader_dll);
+        }
+        cleanup_empty_plugins_dir(game_root);
+        return Err(e);
+    }
+
+    Ok((loader_deployed, true))
+}
+
+/// Remove only the bypass files created by the recorded session. If a recorded file was replaced
+/// while the session was active, leave the replacement untouched and relinquish ownership of it.
+pub(crate) fn cleanup_session_signature_bypass(
+    game_root: &str,
+    loader_deployed: bool,
+    payload_deployed: bool,
+) -> Result<(), String> {
+    let paths = bypass_paths(game_root);
+
+    if payload_deployed
+        && paths.payload_asi.exists()
+        && file_matches(&paths.payload_asi, BYPASS_PAYLOAD_ASI)?
+    {
+        fs::remove_file(&paths.payload_asi)
+            .map_err(|e| format!("remove {}: {e}", paths.payload_asi.display()))?;
+    }
+
+    if loader_deployed
+        && paths.loader_dll.exists()
+        && file_matches(&paths.loader_dll, BYPASS_ASI_LOADER)?
+    {
+        fs::remove_file(&paths.loader_dll)
+            .map_err(|e| format!("remove {}: {e}", paths.loader_dll.display()))?;
+    }
+
+    cleanup_empty_plugins_dir(game_root);
+    Ok(())
+}
+
+pub(crate) fn install_signature_bypass(game_root: &str) -> Result<String, String> {
+    ensure_bundled_bypass_available()?;
 
     let bin_dir = binaries_dir(game_root);
     if !bin_dir.exists() {
@@ -175,16 +327,7 @@ pub(crate) fn remove_signature_bypass(game_root: &str) -> Result<String, String>
         }
     }
 
-    // Drop the plugins dir if our removals left it empty.
-    let plugins = binaries_dir(game_root).join("plugins");
-    if plugins.is_dir()
-        && plugins
-            .read_dir()
-            .map(|mut entries| entries.next().is_none())
-            .unwrap_or(false)
-    {
-        let _ = fs::remove_dir(&plugins);
-    }
+    cleanup_empty_plugins_dir(game_root);
 
     if removed == 0 {
         Ok("Bypass files were not present!".to_string())
@@ -355,6 +498,99 @@ mod tests {
 
         assert_eq!(msg, "Signature bypass already installed.");
         assert_eq!(fs::read(&paths.loader_dll).expect("loader"), b"MZ");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_idle_preserves_a_third_party_loader() {
+        let root = scratch_game_root();
+        let gr = root.to_str().unwrap();
+        let paths = bypass_paths(gr);
+        touch(&paths.loader_dll);
+        fs::create_dir_all(paths.payload_asi.parent().expect("plugins")).expect("plugins");
+        fs::write(&paths.payload_asi, BYPASS_PAYLOAD_ASI).expect("payload");
+
+        remove_session_signature_bypass_at_rest(gr).expect("session idle");
+
+        assert_eq!(fs::read(&paths.loader_dll).expect("loader"), b"MZ");
+        assert!(!paths.payload_asi.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_idle_rejects_a_custom_payload_without_deleting_it() {
+        let root = scratch_game_root();
+        let gr = root.to_str().unwrap();
+        let paths = bypass_paths(gr);
+        touch(&paths.loader_dll);
+        touch(&paths.payload_asi);
+
+        assert!(remove_session_signature_bypass_at_rest(gr).is_err());
+        assert_eq!(fs::read(&paths.loader_dll).expect("loader"), b"MZ");
+        assert_eq!(fs::read(&paths.payload_asi).expect("payload"), b"MZ");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_deploy_uses_and_preserves_a_third_party_loader() {
+        let root = scratch_game_root();
+        let gr = root.to_str().unwrap();
+        let paths = bypass_paths(gr);
+        touch(&paths.loader_dll);
+
+        let (loader_deployed, payload_deployed) =
+            deploy_session_signature_bypass(gr).expect("deploy session bypass");
+        assert!(!loader_deployed);
+        assert!(payload_deployed);
+        assert_eq!(fs::read(&paths.loader_dll).expect("loader"), b"MZ");
+        assert_eq!(
+            fs::read(&paths.payload_asi).expect("payload"),
+            BYPASS_PAYLOAD_ASI
+        );
+
+        cleanup_session_signature_bypass(gr, loader_deployed, payload_deployed)
+            .expect("cleanup session bypass");
+        assert_eq!(fs::read(&paths.loader_dll).expect("loader"), b"MZ");
+        assert!(!paths.payload_asi.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_deploy_cleans_up_the_loader_it_created() {
+        let root = scratch_game_root();
+        let gr = root.to_str().unwrap();
+        let paths = bypass_paths(gr);
+
+        let (loader_deployed, payload_deployed) =
+            deploy_session_signature_bypass(gr).expect("deploy session bypass");
+        assert!(loader_deployed);
+        assert!(payload_deployed);
+
+        cleanup_session_signature_bypass(gr, loader_deployed, payload_deployed)
+            .expect("cleanup session bypass");
+        assert!(!paths.loader_dll.exists());
+        assert!(!paths.payload_asi.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_cleanup_does_not_delete_a_replaced_file() {
+        let root = scratch_game_root();
+        let gr = root.to_str().unwrap();
+        let paths = bypass_paths(gr);
+
+        let (loader_deployed, payload_deployed) =
+            deploy_session_signature_bypass(gr).expect("deploy session bypass");
+        fs::write(&paths.loader_dll, b"replacement").expect("replace loader");
+        fs::write(&paths.payload_asi, b"replacement").expect("replace payload");
+
+        cleanup_session_signature_bypass(gr, loader_deployed, payload_deployed)
+            .expect("cleanup session bypass");
+        assert_eq!(fs::read(&paths.loader_dll).expect("loader"), b"replacement");
+        assert_eq!(
+            fs::read(&paths.payload_asi).expect("payload"),
+            b"replacement"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }

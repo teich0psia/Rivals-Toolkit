@@ -8,6 +8,7 @@ mod steam;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
 
 use epic::find_epic_install;
 use loading_bay::find_loading_bay_install;
@@ -68,6 +69,6 @@ pub(crate) fn detect_install_path() -> Option<InstallInfo> {
 }
 
 #[tauri::command]
-pub(crate) fn launch_game(install_info: InstallInfo) -> Result<(), String> {
-    install_info.launch_game()
+pub(crate) fn launch_game(app: AppHandle, install_info: InstallInfo) -> Result<(), String> {
+    crate::session_launch::launch_game(&app, install_info)
 }

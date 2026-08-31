@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::game_status;
+use crate::session_launch::{self, SessionLaunchState};
+use crate::session_profiles;
 use crate::settings::{ModProfile, Settings, SettingsState, recursive_mod_scan};
 
 use super::folder;
@@ -265,11 +267,16 @@ pub(crate) fn list_mod_profiles(
 #[tauri::command]
 pub(crate) fn save_mod_profile(
     state: State<'_, SettingsState>,
+    session: State<'_, SessionLaunchState>,
     name: String,
     game_root: String,
 ) -> Result<ModProfile, String> {
     let recursive = recursive_mod_scan(&state);
-    save_profile(&state, &name, &game_root, recursive)
+    if session_launch::is_enabled(&session) {
+        session_profiles::save(&state, &session, &name)
+    } else {
+        save_profile(&state, &name, &game_root, recursive)
+    }
 }
 
 #[tauri::command]
@@ -292,26 +299,37 @@ pub(crate) fn rename_mod_profile(
 #[tauri::command]
 pub(crate) fn overwrite_mod_profile(
     state: State<'_, SettingsState>,
+    session: State<'_, SessionLaunchState>,
     name: String,
     game_root: String,
 ) -> Result<ModProfile, String> {
     let recursive = recursive_mod_scan(&state);
-    overwrite_profile(&state, &name, &game_root, recursive)
+    if session_launch::is_enabled(&session) {
+        session_profiles::overwrite(&state, &session, &name)
+    } else {
+        overwrite_profile(&state, &name, &game_root, recursive)
+    }
 }
 
 #[tauri::command]
 pub(crate) fn preview_mod_profile(
     state: State<'_, SettingsState>,
+    session: State<'_, SessionLaunchState>,
     name: String,
     game_root: String,
 ) -> Result<ProfileDiff, String> {
     let recursive = recursive_mod_scan(&state);
-    preview_profile(&state, &name, &game_root, recursive)
+    if session_launch::is_enabled(&session) {
+        session_profiles::preview(&state, &session, &name, &game_root, recursive)
+    } else {
+        preview_profile(&state, &name, &game_root, recursive)
+    }
 }
 
 #[tauri::command]
 pub(crate) fn apply_mod_profile(
     state: State<'_, SettingsState>,
+    session: State<'_, SessionLaunchState>,
     name: String,
     game_root: String,
 ) -> Result<ProfileApplyResult, String> {
@@ -319,5 +337,9 @@ pub(crate) fn apply_mod_profile(
         return Err(game_status::game_running_error());
     }
     let recursive = recursive_mod_scan(&state);
-    apply_profile(&state, &name, &game_root, recursive)
+    if session_launch::is_enabled(&session) {
+        session_profiles::apply(&state, &session, &name, &game_root, recursive)
+    } else {
+        apply_profile(&state, &name, &game_root, recursive)
+    }
 }
